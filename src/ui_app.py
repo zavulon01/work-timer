@@ -1,0 +1,375 @@
+import customtkinter
+import tkinter as tk
+from src.config_manager import load_config, save_config
+from src.notification_helper import send_notification
+from src.strict_window import StrictBreakWindow
+
+# Define Color Scheme
+BG_COLOR = "#12131C"          # Very deep dark purple/grey
+CARD_COLOR = "#1E2030"        # Card background
+TEXT_MAIN = "#FFFFFF"         # Main white text
+TEXT_MUTED = "#8F94A5"        # Muted gray text
+COLOR_FOCUS = "#FF6B6B"       # Vibrant pastel coral red
+COLOR_BREAK = "#2EC4B6"       # Refreshing teal green
+COLOR_TRACK = "#2A2D44"       # Circular progress background track
+
+class CircularProgress(customtkinter.CTkCanvas):
+    def __init__(self, parent, size=220, thickness=12, **kwargs):
+        super().__init__(
+            parent,
+            width=size,
+            height=size,
+            bg=BG_COLOR,
+            highlightthickness=0,
+            **kwargs
+        )
+        self.size = size
+        self.thickness = thickness
+        self.cx = size / 2
+        self.cy = size / 2
+        self.radius = (size - thickness) / 2
+        self.color = COLOR_FOCUS
+        
+        self.draw_track()
+
+    def draw_track(self):
+        self.delete("all")
+        # Draw background track
+        self.create_oval(
+            self.cx - self.radius, self.cy - self.radius,
+            self.cx + self.radius, self.cy + self.radius,
+            outline=COLOR_TRACK, width=self.thickness
+        )
+
+    def set_progress(self, ratio, color):
+        self.color = color
+        self.draw_track()
+        angle = ratio * 360
+        if angle > 0:
+            # Draw active progress arc starting from top (-90 degrees)
+            self.create_arc(
+                self.cx - self.radius, self.cy - self.radius,
+                self.cx + self.radius, self.cy + self.radius,
+                start=90, extent=-angle, style="arc",
+                outline=self.color, width=self.thickness
+            )
+
+
+class PomodoroApp(customtkinter.CTk):
+    def __init__(self):
+        super().__init__()
+        
+        # Load configuration
+        self.config = load_config()
+        self.focus_duration = self.config["focus_duration_minutes"] * 60
+        self.break_duration = self.config["break_duration_minutes"] * 60
+        self.strict_break_enabled = self.config["strict_break_enabled"]
+        
+        # State variables
+        self.current_mode = "focus"  # "focus" or "break"
+        self.timer_state = "idle"    # "idle", "running", "paused"
+        self.remaining_seconds = self.focus_duration
+        self.is_hidden = False
+        self.strict_window = None
+        
+        # Configure Main Window
+        self.title("Work Timer")
+        self.geometry("380x560")
+        self.resizable(False, False)
+        self.configure(fg_color=BG_COLOR)
+        
+        # System Tray support
+        self.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
+        
+        # Create Layout
+        self.setup_ui()
+        self.update_timer_display()
+
+    def setup_ui(self):
+        # 1. Header / Mode Switcher Frame
+        self.mode_frame = customtkinter.CTkFrame(self, fg_color="transparent")
+        self.mode_frame.pack(pady=(25, 10))
+        
+        self.btn_focus = customtkinter.CTkButton(
+            self.mode_frame,
+            text="Работа",
+            width=110,
+            height=32,
+            corner_radius=20,
+            fg_color=COLOR_FOCUS,
+            hover_color="#E05B5B",
+            font=("Outfit", 14, "bold"),
+            command=lambda: self.switch_mode("focus")
+        )
+        self.btn_focus.pack(side="left", padx=5)
+        
+        self.btn_break = customtkinter.CTkButton(
+            self.mode_frame,
+            text="Перерыв",
+            width=110,
+            height=32,
+            corner_radius=20,
+            fg_color=CARD_COLOR,
+            text_color=TEXT_MUTED,
+            hover_color="#2A2D44",
+            font=("Outfit", 14, "bold"),
+            command=lambda: self.switch_mode("break")
+        )
+        self.btn_break.pack(side="left", padx=5)
+        
+        # 2. Main Timer Area
+        self.timer_container = customtkinter.CTkFrame(self, fg_color="transparent")
+        self.timer_container.pack(pady=20)
+        
+        # Circular Canvas
+        self.progress_ring = CircularProgress(self.timer_container)
+        self.progress_ring.pack()
+        
+        # Overlay Timer Label inside Canvas (using standard tk label layered or overlay coordinates)
+        # However, drawing text directly on canvas looks cleaner and aligns perfectly
+        self.canvas_text_id = self.progress_ring.create_text(
+            110, 110,
+            text="25:00",
+            fill=TEXT_MAIN,
+            font=("Outfit", 40, "bold")
+        )
+        self.canvas_subtext_id = self.progress_ring.create_text(
+            110, 150,
+            text="FOCUS",
+            fill=TEXT_MUTED,
+            font=("Outfit", 11, "bold")
+        )
+
+        # 3. Control Buttons
+        self.control_frame = customtkinter.CTkFrame(self, fg_color="transparent")
+        self.control_frame.pack(pady=10)
+        
+        self.btn_start = customtkinter.CTkButton(
+            self.control_frame,
+            text="Старт",
+            width=120,
+            height=40,
+            corner_radius=8,
+            fg_color="#3A3F58",
+            hover_color="#4E5474",
+            font=("Outfit", 14, "bold"),
+            command=self.toggle_timer
+        )
+        self.btn_start.pack(side="left", padx=10)
+        
+        self.btn_reset = customtkinter.CTkButton(
+            self.control_frame,
+            text="Сброс",
+            width=120,
+            height=40,
+            corner_radius=8,
+            fg_color="transparent",
+            border_width=2,
+            border_color="#3A3F58",
+            hover_color="#1E2030",
+            font=("Outfit", 14, "bold"),
+            command=self.reset_timer
+        )
+        self.btn_reset.pack(side="left", padx=10)
+        
+        # Divider
+        divider = customtkinter.CTkFrame(self, height=2, fg_color=CARD_COLOR)
+        divider.pack(fill="x", padx=40, pady=15)
+        
+        # 4. Settings Panel (Collapsible/Inner Frame)
+        self.settings_frame = customtkinter.CTkFrame(self, fg_color=CARD_COLOR, corner_radius=12)
+        self.settings_frame.pack(fill="x", padx=25, pady=(5, 20))
+        
+        # Focus Duration Row
+        lbl_focus = customtkinter.CTkLabel(self.settings_frame, text="Время работы (мин):", font=("Outfit", 12), text_color=TEXT_MUTED)
+        lbl_focus.grid(row=0, column=0, padx=15, pady=8, sticky="w")
+        
+        self.entry_focus = customtkinter.CTkEntry(self.settings_frame, width=60, height=25, border_width=1, fg_color=BG_COLOR)
+        self.entry_focus.insert(0, str(int(self.focus_duration / 60)))
+        self.entry_focus.grid(row=0, column=1, padx=15, pady=8, sticky="e")
+        
+        # Break Duration Row
+        lbl_break = customtkinter.CTkLabel(self.settings_frame, text="Время перерыва (мин):", font=("Outfit", 12), text_color=TEXT_MUTED)
+        lbl_break.grid(row=1, column=0, padx=15, pady=8, sticky="w")
+        
+        self.entry_break = customtkinter.CTkEntry(self.settings_frame, width=60, height=25, border_width=1, fg_color=BG_COLOR)
+        self.entry_break.insert(0, str(int(self.break_duration / 60)))
+        self.entry_break.grid(row=1, column=1, padx=15, pady=8, sticky="e")
+        
+        # Strict Break Option Row
+        lbl_strict = customtkinter.CTkLabel(self.settings_frame, text="Строгий перерыв:", font=("Outfit", 12), text_color=TEXT_MUTED)
+        lbl_strict.grid(row=2, column=0, padx=15, pady=8, sticky="w")
+        
+        self.switch_strict = customtkinter.CTkSwitch(
+            self.settings_frame,
+            text="",
+            progress_color=COLOR_BREAK,
+            width=40
+        )
+        if self.strict_break_enabled:
+            self.switch_strict.select()
+        self.switch_strict.grid(row=2, column=1, padx=15, pady=8, sticky="e")
+        
+        # Save Button
+        self.btn_save = customtkinter.CTkButton(
+            self.settings_frame,
+            text="Сохранить настройки",
+            height=30,
+            fg_color=CARD_COLOR,
+            border_width=1,
+            border_color="#3A3F58",
+            hover_color="#2A2D44",
+            font=("Outfit", 12, "bold"),
+            command=self.save_settings
+        )
+        self.btn_save.grid(row=3, column=0, columnspan=2, padx=15, pady=(5, 12), sticky="ew")
+        
+        # Grid weight
+        self.settings_frame.grid_columnconfigure(0, weight=1)
+        self.settings_frame.grid_columnconfigure(1, weight=0)
+
+    def update_timer_display(self):
+        # Format string
+        minutes = self.remaining_seconds // 60
+        seconds = self.remaining_seconds % 60
+        time_str = f"{minutes:02d}:{seconds:02d}"
+        
+        # Set colors based on mode
+        color = COLOR_FOCUS if self.current_mode == "focus" else COLOR_BREAK
+        subtext = "FOCUS" if self.current_mode == "focus" else "BREAK"
+        
+        # Calculate ratio
+        total_seconds = self.focus_duration if self.current_mode == "focus" else self.break_duration
+        ratio = (total_seconds - self.remaining_seconds) / total_seconds if total_seconds > 0 else 0
+        
+        # Update canvas elements
+        self.progress_ring.set_progress(ratio, color)
+        self.progress_ring.itemconfig(self.canvas_text_id, text=time_str)
+        self.progress_ring.itemconfig(self.canvas_subtext_id, text=subtext, fill=color)
+
+    def switch_mode(self, target_mode):
+        self.current_mode = target_mode
+        if target_mode == "focus":
+            self.btn_focus.configure(fg_color=COLOR_FOCUS, text_color=TEXT_MAIN)
+            self.btn_break.configure(fg_color=CARD_COLOR, text_color=TEXT_MUTED)
+            self.remaining_seconds = self.focus_duration
+        else:
+            self.btn_break.configure(fg_color=COLOR_BREAK, text_color=TEXT_MAIN)
+            self.btn_focus.configure(fg_color=CARD_COLOR, text_color=TEXT_MUTED)
+            self.remaining_seconds = self.break_duration
+            
+        self.update_timer_display()
+        
+        # Reset running states when mode is switched manually
+        if self.timer_state == "running":
+            self.pause_timer()
+
+    def toggle_timer(self):
+        if self.timer_state == "running":
+            self.pause_timer()
+        else:
+            self.start_timer()
+
+    def start_timer(self):
+        self.timer_state = "running"
+        self.btn_start.configure(text="Пауза", fg_color="#FF9F1C", hover_color="#E08A12")  # Orange warning/pause color
+        self.tick()
+
+    def pause_timer(self):
+        self.timer_state = "paused"
+        self.btn_start.configure(text="Старт", fg_color="#3A3F58", hover_color="#4E5474")
+
+    def reset_timer(self):
+        self.timer_state = "idle"
+        self.btn_start.configure(text="Старт", fg_color="#3A3F58", hover_color="#4E5474")
+        self.remaining_seconds = self.focus_duration if self.current_mode == "focus" else self.break_duration
+        self.update_timer_display()
+
+    def tick(self):
+        if self.timer_state != "running":
+            return
+        
+        if self.remaining_seconds > 0:
+            self.remaining_seconds -= 1
+            self.update_timer_display()
+            self.after(1000, self.tick)
+        else:
+            self.handle_timer_completed()
+
+    def handle_timer_completed(self):
+        self.timer_state = "idle"
+        self.btn_start.configure(text="Старт", fg_color="#3A3F58", hover_color="#4E5474")
+        
+        if self.current_mode == "focus":
+            send_notification("Время отдохнуть!", "Рабочий интервал окончен. Пора сделать перерыв.")
+            self.switch_mode("break")
+            
+            # Open strict break screen if enabled
+            if self.strict_break_enabled:
+                self.show_strict_break()
+                
+            # If minimized/hidden, bring timer window back or show notifications
+            if self.is_hidden and not self.strict_break_enabled:
+                self.restore_window()
+                
+            # Automatically start the break
+            self.start_timer()
+        else:
+            send_notification("Пора за работу!", "Перерыв завершен. Время сфокусироваться!")
+            self.switch_mode("focus")
+            if self.is_hidden:
+                self.restore_window()
+
+    def show_strict_break(self):
+        # Open the full-screen strict window overlay
+        if self.strict_window is not None:
+            try:
+                self.strict_window.destroy()
+            except Exception:
+                pass
+        
+        self.strict_window = StrictBreakWindow(self, lambda: self.remaining_seconds)
+
+    def save_settings(self):
+        try:
+            focus_mins = int(self.entry_focus.get())
+            break_mins = int(self.entry_break.get())
+            
+            if focus_mins <= 0 or break_mins <= 0:
+                raise ValueError()
+                
+            self.focus_duration = focus_mins * 60
+            self.break_duration = break_mins * 60
+            self.strict_break_enabled = self.switch_strict.get()
+            
+            # Save to config file
+            config_data = {
+                "focus_duration_minutes": focus_mins,
+                "break_duration_minutes": break_mins,
+                "strict_break_enabled": self.strict_break_enabled
+            }
+            save_config(config_data)
+            
+            # Apply duration change immediately if idle/reset
+            if self.timer_state == "idle":
+                self.reset_timer()
+                
+            # Show standard tk message dialog/tooltip dynamically or just visually indicate
+            self.btn_save.configure(text="Сохранено!", fg_color="#2EC4B6")
+            self.after(2000, lambda: self.btn_save.configure(text="Сохранить настройки", fg_color=CARD_COLOR))
+        except ValueError:
+            # Revert UI values or show error color
+            self.btn_save.configure(text="Ошибка (введите числа)!", fg_color="#FF6B6B")
+            self.after(2000, lambda: self.btn_save.configure(text="Сохранить настройки", fg_color=CARD_COLOR))
+
+    def minimize_to_tray(self):
+        self.withdraw()
+        self.is_hidden = True
+
+    def restore_window(self):
+        self.deiconify()
+        self.focus_force()
+        self.is_hidden = False
+        # Push to front
+        self.attributes("-topmost", True)
+        self.after(200, lambda: self.attributes("-topmost", False))
