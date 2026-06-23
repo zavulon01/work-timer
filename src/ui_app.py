@@ -13,46 +13,84 @@ COLOR_FOCUS = "#FF6B6B"       # Vibrant pastel coral red
 COLOR_BREAK = "#2EC4B6"       # Refreshing teal green
 COLOR_TRACK = "#2A2D44"       # Circular progress background track
 
-class CircularProgress(customtkinter.CTkCanvas):
+import customtkinter
+import tkinter as tk
+from PIL import Image, ImageDraw
+from src.config_manager import load_config, save_config
+from src.notification_helper import send_notification
+from src.strict_window import StrictBreakWindow
+
+# Define Color Scheme
+BG_COLOR = "#12131C"          # Very deep dark purple/grey
+CARD_COLOR = "#1E2030"        # Card background
+TEXT_MAIN = "#FFFFFF"         # Main white text
+TEXT_MUTED = "#8F94A5"        # Muted gray text
+COLOR_FOCUS = "#FF6B6B"       # Vibrant pastel coral red
+COLOR_BREAK = "#2EC4B6"       # Refreshing teal green
+COLOR_TRACK = "#2A2D44"       # Circular progress background track
+
+class CircularProgress(customtkinter.CTkLabel):
     def __init__(self, parent, size=220, thickness=12, **kwargs):
         super().__init__(
             parent,
+            text="",
             width=size,
             height=size,
-            bg=BG_COLOR,
-            highlightthickness=0,
             **kwargs
         )
         self.size = size
         self.thickness = thickness
-        self.cx = size / 2
-        self.cy = size / 2
-        self.radius = (size - thickness) / 2
-        self.color = COLOR_FOCUS
+        self.image = None
         
-        self.draw_track()
-
-    def draw_track(self):
-        self.delete("all")
-        # Draw background track
-        self.create_oval(
-            self.cx - self.radius, self.cy - self.radius,
-            self.cx + self.radius, self.cy + self.radius,
-            outline=COLOR_TRACK, width=self.thickness
+    def set_progress(self, ratio, color_hex):
+        # Generate the circle image using Pillow with anti-aliasing (supersampling)
+        img = self.generate_circle_image(ratio, color_hex)
+        
+        # Create CTkImage for high DPI support
+        ctk_img = customtkinter.CTkImage(
+            light_image=img,
+            dark_image=img,
+            size=(self.size, self.size)
         )
+        self.configure(image=ctk_img)
+        self.image = ctk_img  # Keep reference
 
-    def set_progress(self, ratio, color):
-        self.color = color
-        self.draw_track()
+    def generate_circle_image(self, ratio, color_hex) -> Image.Image:
+        scale = 4  # Draw 4x larger for high-quality antialiasing
+        img_size = self.size * scale
+        thick = self.thickness * scale
+        
+        def hex_to_rgba(hex_str):
+            hex_str = hex_str.lstrip('#')
+            return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4)) + (255,)
+            
+        color = hex_to_rgba(color_hex)
+        bg = hex_to_rgba(BG_COLOR)
+        track = hex_to_rgba(COLOR_TRACK)
+        
+        img = Image.new("RGBA", (img_size, img_size), bg)
+        draw = ImageDraw.Draw(img)
+        
+        # Bounding box
+        pad = thick / 2
+        bbox = [pad, pad, img_size - pad, img_size - pad]
+        
+        # Draw background track
+        draw.ellipse(bbox, outline=track, width=thick)
+        
+        # Draw active progress arc (Pillow: start=-90 deg is top, goes clockwise)
         angle = ratio * 360
         if angle > 0:
-            # Draw active progress arc starting from top (-90 degrees)
-            self.create_arc(
-                self.cx - self.radius, self.cy - self.radius,
-                self.cx + self.radius, self.cy + self.radius,
-                start=90, extent=-angle, style="arc",
-                outline=self.color, width=self.thickness
+            draw.arc(
+                bbox,
+                start=-90,
+                end=-90 + angle,
+                fill=color,
+                width=thick
             )
+            
+        # Resize to target size using high-quality Lanczos resampling
+        return img.resize((self.size, self.size), resample=Image.Resampling.LANCZOS)
 
 
 class PomodoroApp(customtkinter.CTk):
@@ -71,6 +109,7 @@ class PomodoroApp(customtkinter.CTk):
         self.remaining_seconds = self.focus_duration
         self.is_hidden = False
         self.strict_window = None
+        self.tick_job = None         # Holds the scheduled tk after job
         
         # Configure Main Window
         self.title("Work Timer")
@@ -120,25 +159,32 @@ class PomodoroApp(customtkinter.CTk):
         # 2. Main Timer Area
         self.timer_container = customtkinter.CTkFrame(self, fg_color="transparent")
         self.timer_container.pack(pady=20)
+        self.timer_container.grid_rowconfigure(0, weight=1)
+        self.timer_container.grid_columnconfigure(0, weight=1)
         
-        # Circular Canvas
+        # Circular Progress ring as background layer in grid cell (0,0)
         self.progress_ring = CircularProgress(self.timer_container)
-        self.progress_ring.pack()
+        self.progress_ring.grid(row=0, column=0, sticky="nsew")
         
-        # Overlay Timer Label inside Canvas (using standard tk label layered or overlay coordinates)
-        # However, drawing text directly on canvas looks cleaner and aligns perfectly
-        self.canvas_text_id = self.progress_ring.create_text(
-            110, 110,
+        # Text overlay container in the same grid cell (0,0)
+        self.text_overlay = customtkinter.CTkFrame(self.timer_container, fg_color="transparent")
+        self.text_overlay.grid(row=0, column=0)
+        
+        self.timer_label = customtkinter.CTkLabel(
+            self.text_overlay,
             text="25:00",
-            fill=TEXT_MAIN,
-            font=("Outfit", 40, "bold")
+            font=("Outfit", 40, "bold"),
+            text_color=TEXT_MAIN
         )
-        self.canvas_subtext_id = self.progress_ring.create_text(
-            110, 150,
+        self.timer_label.pack()
+        
+        self.sub_label = customtkinter.CTkLabel(
+            self.text_overlay,
             text="FOCUS",
-            fill=TEXT_MUTED,
-            font=("Outfit", 11, "bold")
+            font=("Outfit", 11, "bold"),
+            text_color=TEXT_MUTED
         )
+        self.sub_label.pack()
 
         # 3. Control Buttons
         self.control_frame = customtkinter.CTkFrame(self, fg_color="transparent")
@@ -176,7 +222,7 @@ class PomodoroApp(customtkinter.CTk):
         divider = customtkinter.CTkFrame(self, height=2, fg_color=CARD_COLOR)
         divider.pack(fill="x", padx=40, pady=15)
         
-        # 4. Settings Panel (Collapsible/Inner Frame)
+        # 4. Settings Panel
         self.settings_frame = customtkinter.CTkFrame(self, fg_color=CARD_COLOR, corner_radius=12)
         self.settings_frame.pack(fill="x", padx=25, pady=(5, 20))
         
@@ -224,30 +270,31 @@ class PomodoroApp(customtkinter.CTk):
         )
         self.btn_save.grid(row=3, column=0, columnspan=2, padx=15, pady=(5, 12), sticky="ew")
         
-        # Grid weight
         self.settings_frame.grid_columnconfigure(0, weight=1)
         self.settings_frame.grid_columnconfigure(1, weight=0)
 
     def update_timer_display(self):
-        # Format string
         minutes = self.remaining_seconds // 60
         seconds = self.remaining_seconds % 60
         time_str = f"{minutes:02d}:{seconds:02d}"
         
-        # Set colors based on mode
         color = COLOR_FOCUS if self.current_mode == "focus" else COLOR_BREAK
         subtext = "FOCUS" if self.current_mode == "focus" else "BREAK"
         
-        # Calculate ratio
         total_seconds = self.focus_duration if self.current_mode == "focus" else self.break_duration
         ratio = (total_seconds - self.remaining_seconds) / total_seconds if total_seconds > 0 else 0
         
-        # Update canvas elements
+        # Update progress and text labels
         self.progress_ring.set_progress(ratio, color)
-        self.progress_ring.itemconfig(self.canvas_text_id, text=time_str)
-        self.progress_ring.itemconfig(self.canvas_subtext_id, text=subtext, fill=color)
+        self.timer_label.configure(text=time_str)
+        self.sub_label.configure(text=subtext, text_color=color)
 
     def switch_mode(self, target_mode):
+        # Cancel any scheduled tick
+        if self.tick_job is not None:
+            self.after_cancel(self.tick_job)
+            self.tick_job = None
+            
         self.current_mode = target_mode
         if target_mode == "focus":
             self.btn_focus.configure(fg_color=COLOR_FOCUS, text_color=TEXT_MAIN)
@@ -258,11 +305,9 @@ class PomodoroApp(customtkinter.CTk):
             self.btn_focus.configure(fg_color=CARD_COLOR, text_color=TEXT_MUTED)
             self.remaining_seconds = self.break_duration
             
+        self.timer_state = "idle"
+        self.btn_start.configure(text="Старт", fg_color="#3A3F58", hover_color="#4E5474")
         self.update_timer_display()
-        
-        # Reset running states when mode is switched manually
-        if self.timer_state == "running":
-            self.pause_timer()
 
     def toggle_timer(self):
         if self.timer_state == "running":
@@ -271,17 +316,29 @@ class PomodoroApp(customtkinter.CTk):
             self.start_timer()
 
     def start_timer(self):
+        # Prevent spawning multiple tick loops
+        if self.tick_job is not None:
+            self.after_cancel(self.tick_job)
+            self.tick_job = None
+            
         self.timer_state = "running"
-        self.btn_start.configure(text="Пауза", fg_color="#FF9F1C", hover_color="#E08A12")  # Orange warning/pause color
+        self.btn_start.configure(text="Пауза", fg_color="#FF9F1C", hover_color="#E08A12")
         self.tick()
 
     def pause_timer(self):
         self.timer_state = "paused"
         self.btn_start.configure(text="Старт", fg_color="#3A3F58", hover_color="#4E5474")
+        if self.tick_job is not None:
+            self.after_cancel(self.tick_job)
+            self.tick_job = None
 
     def reset_timer(self):
         self.timer_state = "idle"
         self.btn_start.configure(text="Старт", fg_color="#3A3F58", hover_color="#4E5474")
+        if self.tick_job is not None:
+            self.after_cancel(self.tick_job)
+            self.tick_job = None
+            
         self.remaining_seconds = self.focus_duration if self.current_mode == "focus" else self.break_duration
         self.update_timer_display()
 
@@ -292,27 +349,27 @@ class PomodoroApp(customtkinter.CTk):
         if self.remaining_seconds > 0:
             self.remaining_seconds -= 1
             self.update_timer_display()
-            self.after(1000, self.tick)
+            self.tick_job = self.after(1000, self.tick)
         else:
             self.handle_timer_completed()
 
     def handle_timer_completed(self):
         self.timer_state = "idle"
         self.btn_start.configure(text="Старт", fg_color="#3A3F58", hover_color="#4E5474")
-        
+        if self.tick_job is not None:
+            self.after_cancel(self.tick_job)
+            self.tick_job = None
+            
         if self.current_mode == "focus":
             send_notification("Время отдохнуть!", "Рабочий интервал окончен. Пора сделать перерыв.")
             self.switch_mode("break")
             
-            # Open strict break screen if enabled
             if self.strict_break_enabled:
                 self.show_strict_break()
                 
-            # If minimized/hidden, bring timer window back or show notifications
             if self.is_hidden and not self.strict_break_enabled:
                 self.restore_window()
                 
-            # Automatically start the break
             self.start_timer()
         else:
             send_notification("Пора за работу!", "Перерыв завершен. Время сфокусироваться!")
@@ -321,7 +378,6 @@ class PomodoroApp(customtkinter.CTk):
                 self.restore_window()
 
     def show_strict_break(self):
-        # Open the full-screen strict window overlay
         if self.strict_window is not None:
             try:
                 self.strict_window.destroy()
@@ -342,7 +398,7 @@ class PomodoroApp(customtkinter.CTk):
             self.break_duration = break_mins * 60
             self.strict_break_enabled = self.switch_strict.get()
             
-            # Save to config file
+            # Save configuration
             config_data = {
                 "focus_duration_minutes": focus_mins,
                 "break_duration_minutes": break_mins,
@@ -350,15 +406,12 @@ class PomodoroApp(customtkinter.CTk):
             }
             save_config(config_data)
             
-            # Apply duration change immediately if idle/reset
-            if self.timer_state == "idle":
-                self.reset_timer()
-                
-            # Show standard tk message dialog/tooltip dynamically or just visually indicate
+            # Always reset the timer to apply duration settings immediately
+            self.reset_timer()
+            
             self.btn_save.configure(text="Сохранено!", fg_color="#2EC4B6")
             self.after(2000, lambda: self.btn_save.configure(text="Сохранить настройки", fg_color=CARD_COLOR))
         except ValueError:
-            # Revert UI values or show error color
             self.btn_save.configure(text="Ошибка (введите числа)!", fg_color="#FF6B6B")
             self.after(2000, lambda: self.btn_save.configure(text="Сохранить настройки", fg_color=CARD_COLOR))
 
@@ -370,6 +423,5 @@ class PomodoroApp(customtkinter.CTk):
         self.deiconify()
         self.focus_force()
         self.is_hidden = False
-        # Push to front
         self.attributes("-topmost", True)
         self.after(200, lambda: self.attributes("-topmost", False))
